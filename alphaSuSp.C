@@ -8,19 +8,6 @@
 License
     This file is part of OpenFOAM.
 
-    OpenFOAM is free software: you can redistribute it and/or modify it
-    under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    OpenFOAM is distributed in the hope that it will be useful, but WITHOUT
-    ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
-    FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
-    for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with OpenFOAM.  If not, see <http://www.gnu.org/licenses/>.
-
 \*---------------------------------------------------------------------------*/
 
 #include "compressibleVoF_DED.H"
@@ -64,6 +51,34 @@ void Foam::solvers::compressibleVoF_DED::alphaSuSp
 
         Su -= alpha1ByRho2*(alphaRho2Sup.Su() + alphaRho2Sup.Sp());
         Sp += alpha1ByRho2*alphaRho2Sup.Sp();
+    }
+
+    // Phase-C mass-conserving evaporation: metal (1) → gas (2)
+    // Mass rates: S1 = -mDot, S2 = +mDot
+    // Converted to α1 sources like compressible VoF rho-source mapping:
+    //   Su += (α2/ρ1)*S1 - (α1/ρ2)*S2
+    //       = -mDot*(α2/ρ1 + α1/ρ2)
+    if (massConservingEvaporation_)
+    {
+        const volScalarField::Internal& rho1 = mixture.rho1()();
+        const volScalarField::Internal& rho2 = mixture.rho2()();
+
+        forAll(Su, celli)
+        {
+            const scalar md = mDotEvap_[celli];
+            if (md <= SMALL)
+            {
+                continue;
+            }
+
+            const scalar r1 = max(rho1[celli], SMALL);
+            const scalar r2 = max(rho2[celli], SMALL);
+            const scalar a1 = min(max(alpha1[celli], 0.0), 1.0);
+            const scalar a2 = min(max(alpha2[celli], 0.0), 1.0);
+
+            // Explicit α1 destruction (stabilised)
+            Su[celli] -= md*(a2/r1 + a1/r2);
+        }
     }
 
     forAll(vDot, celli)

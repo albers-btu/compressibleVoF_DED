@@ -55,9 +55,23 @@ void Foam::solvers::compressibleVoF_DED::pressureCorrector()
 
     const surfaceScalarField rAUf("rAUf", fvc::interpolate(rAU()));
 
+    // CSF free-surface pressure forces (same path as surface tension):
+    //   recoil:  p_r * snGrad(α)
+    //   Marangoni: face-normal projection of volumetric force (set in thermo)
+    const surfaceScalarField recoilPressureForce
+    (
+        "recoilPressureForce",
+        fvc::interpolate(pRecoil_)*fvc::snGrad(alpha1)
+    );
+
     while (pimple.correct())
     {
-        const volVectorField HbyA(constrainHbyA(rAU()*UEqn.H(), U, p_rgh));
+        // Marangoni is tangential → couple as volumetric body force in HbyA
+        // (face-normal CSF path alone under-represents ∇_∥σ)
+        volVectorField HbyA(constrainHbyA(rAU()*UEqn.H(), U, p_rgh));
+        HbyA += rAU()*marangoniForce_;
+        HbyA.correctBoundaryConditions();
+
         surfaceScalarField phiHbyA
         (
             "phiHbyA",
@@ -67,10 +81,12 @@ void Foam::solvers::compressibleVoF_DED::pressureCorrector()
 
         MRF.makeRelative(phiHbyA);
 
+        // Normal free-surface forces only on the face (CSF) path
         const surfaceScalarField phig
         (
             (
                 surfaceTensionForce()
+              + recoilPressureForce
               - buoyancy.ghf*fvc::snGrad(rho)
             )*rAUf*mesh.magSf()
         );
@@ -86,6 +102,27 @@ void Foam::solvers::compressibleVoF_DED::pressureCorrector()
             fvModels().sourceProxy(alpha1, rho1, p_rgh)/rho1
           + fvModels().sourceProxy(alpha2, rho2, p_rgh)/rho2
         );
+
+        // Phase-C: metal→gas mass transfer volume source
+        // S1=-mDot, S2=+mDot → S1/ρ1 + S2/ρ2 = mDot (1/ρ2 − 1/ρ1)
+        volScalarField::Internal phaseChangeDivU
+        (
+            volScalarField::Internal::New
+            (
+                "phaseChangeDivU",
+                mesh,
+                dimensionedScalar(dimless/dimTime, 0)
+            )
+        );
+
+        if (massConservingEvaporation_)
+        {
+            phaseChangeDivU =
+                (
+                    mDotEvap_
+                   *(scalar(1)/rho2 - scalar(1)/rho1)
+                )();
+        }
 
         // Make the fluxes relative to the mesh motion
         fvc::makeRelative(phiHbyA, U);
@@ -168,7 +205,7 @@ void Foam::solvers::compressibleVoF_DED::pressureCorrector()
             fvScalarMatrix p_rghEqnIncomp
             (
                 fvc::div(phiHbyA) - fvm::laplacian(rAUf, p_rgh)
-             == p_rghEqnSource
+             == p_rghEqnSource + phaseChangeDivU
             );
 
             {
@@ -221,6 +258,35 @@ void Foam::solvers::compressibleVoF_DED::pressureCorrector()
 
     clearrAU();
     tUEqn.clear();
+
+    // Compact free-surface hydro diagnostics (final outer iter only)
+    if (pimple.finalIter())
+    {
+        scalar maxLiquidVelocity = 0.0;
+        label liquidCells = 0;
+
+        forAll(U, celli)
+        {
+            const scalar liquidMetalFraction =
+                min(max(alpha1[celli], 0.0), 1.0)
+               *min(max(fLiquid_[celli], 0.0), 1.0);
+
+            if (liquidMetalFraction > 1e-3)
+            {
+                ++liquidCells;
+                maxLiquidVelocity = max(maxLiquidVelocity, mag(U[celli]));
+            }
+        }
+
+        reduce(maxLiquidVelocity, maxOp<scalar>());
+        reduce(liquidCells, sumOp<label>());
+
+        Info<< "DED pressure:"
+            << " liquidCells=" << liquidCells
+            << " maxLiquidVelocity=" << maxLiquidVelocity
+            << " max(pRecoil)=" << gMax(pRecoil_)
+            << endl;
+    }
 }
 
 

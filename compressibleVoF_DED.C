@@ -8,19 +8,6 @@
 License
     This file is part of OpenFOAM.
 
-    OpenFOAM is free software: you can redistribute it and/or modify it
-    under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    OpenFOAM is distributed in the hope that it will be useful, but WITHOUT
-    ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
-    FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
-    for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with OpenFOAM.  If not, see <http://www.gnu.org/licenses/>.
-
 \*---------------------------------------------------------------------------*/
 
 #include "compressibleVoF_DED.H"
@@ -51,6 +38,8 @@ bool Foam::solvers::compressibleVoF_DED::read()
 
     vDotResidualAlpha =
         alphaControls.lookupOrDefault("vDotResidualAlpha", 1e-4);
+
+    readDEDProperties();
 
     return true;
 }
@@ -108,6 +97,244 @@ Foam::solvers::compressibleVoF_DED::compressibleVoF_DED(fvMesh& mesh)
 
     K("K", 0.5*magSqr(U)),
 
+    pRecoil_
+    (
+        IOobject
+        (
+            "pRecoil",
+            runTime.name(),
+            mesh,
+            IOobject::READ_IF_PRESENT,
+            IOobject::AUTO_WRITE
+        ),
+        mesh,
+        dimensionedScalar(dimPressure, 0)
+    ),
+
+    fLiquid_
+    (
+        IOobject
+        (
+            "fLiquid",
+            runTime.name(),
+            mesh,
+            IOobject::READ_IF_PRESENT,
+            IOobject::AUTO_WRITE
+        ),
+        mesh,
+        dimensionedScalar(dimless, 0)
+    ),
+
+    fLiquidPrev_
+    (
+        IOobject
+        (
+            "fLiquidPrev",
+            runTime.name(),
+            mesh,
+            IOobject::READ_IF_PRESENT,
+            IOobject::NO_WRITE
+        ),
+        fLiquid_
+    ),
+
+    marangoniForce_
+    (
+        IOobject
+        (
+            "marangoniForce",
+            runTime.name(),
+            mesh,
+            IOobject::READ_IF_PRESENT,
+            IOobject::AUTO_WRITE
+        ),
+        mesh,
+        dimensionedVector
+        (
+            "zero",
+            dimensionSet(1, -2, -2, 0, 0, 0, 0),
+            vector::zero
+        )
+    ),
+
+    marangoniForcef_
+    (
+        IOobject
+        (
+            "marangoniForcef",
+            runTime.name(),
+            mesh,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE
+        ),
+        mesh,
+        dimensionedScalar
+        (
+            "zero",
+            dimensionSet(1, -2, -2, 0, 0, 0, 0),
+            0
+        )
+    ),
+
+    gasSpongeResistance_
+    (
+        IOobject
+        (
+            "gasSpongeResistance",
+            runTime.name(),
+            mesh,
+            IOobject::NO_READ,
+            IOobject::AUTO_WRITE
+        ),
+        mesh,
+        dimensionedScalar
+        (
+            "zero",
+            dimensionSet(1, -3, -1, 0, 0, 0, 0),
+            0.0
+        )
+    ),
+
+    mushyResistance_
+    (
+        IOobject
+        (
+            "mushyResistance",
+            runTime.name(),
+            mesh,
+            IOobject::NO_READ,
+            IOobject::AUTO_WRITE
+        ),
+        mesh,
+        dimensionedScalar
+        (
+            "zero",
+            dimensionSet(1, -3, -1, 0, 0, 0, 0),
+            0.0
+        )
+    ),
+
+    evaporationSink_
+    (
+        IOobject
+        (
+            "evaporationSink",
+            runTime.name(),
+            mesh,
+            IOobject::READ_IF_PRESENT,
+            IOobject::AUTO_WRITE
+        ),
+        mesh,
+        dimensionedScalar
+        (
+            "zero",
+            dimensionSet(1, -1, -3, 0, 0, 0, 0),
+            0.0
+        )
+    ),
+
+    mDotEvap_
+    (
+        IOobject
+        (
+            "mDotEvap",
+            runTime.name(),
+            mesh,
+            IOobject::READ_IF_PRESENT,
+            IOobject::AUTO_WRITE
+        ),
+        mesh,
+        dimensionedScalar
+        (
+            "zero",
+            dimensionSet(1, -3, -1, 0, 0, 0, 0),
+            0.0
+        )
+    ),
+
+    interfaceDelta_
+    (
+        IOobject
+        (
+            "interfaceDelta",
+            runTime.name(),
+            mesh,
+            IOobject::NO_READ,
+            IOobject::AUTO_WRITE
+        ),
+        mesh,
+        dimensionedScalar("zero", dimless/dimLength, 0)
+    ),
+
+    Qlaser_
+    (
+        IOobject
+        (
+            "Qlaser",
+            runTime.name(),
+            mesh,
+            IOobject::NO_READ,
+            IOobject::AUTO_WRITE
+        ),
+        mesh,
+        dimensionedScalar
+        (
+            "zero",
+            dimensionSet(1, -1, -3, 0, 0, 0, 0),
+            0
+        )
+    ),
+
+    laserPower_(0),
+    absorptivity_(0),
+    laserSpeed_(0),
+    xStart_(0),
+    yStart_(0),
+    laserRadius_(0),
+    laserRampTime_(1e-3),
+    forceRelaxation_(0.3),
+    evaporationRelaxation_(0.3),
+    laserTopSurfaceBias_(1.0),
+    laserMaxDeltaT_(500),
+    laserMinIntegralFraction_(0.05),
+    PsatMax_(2e6),
+    TmaxEval_(6000),
+    boilSoftWidth_(50),
+    alphaEvap_(1),
+    limitEvapByLaser_(false),
+    massConservingEvaporation_(true),
+    nLatentCorrectors_(2),
+    liquidFractionRelaxation_(0.7),
+    laserAbsorptionLength_(0),
+    laserBulkFraction_(0.25),
+    solidusTemperature_(1700),
+    liquidusTemperature_(1800),
+    Tboil_(3000),
+    Lv_(0),
+    Mv_(0.056),
+    Rs_(8.314462618/0.056),
+    emissivity_(0.5),
+    Tamb_(300),
+
+    Lf_("Lf", dimEnergy/dimMass, 0),
+    dSigma_dT_
+    (
+        "dSigma_dT",
+        dimensionSet(1, 0, -2, -1, 0, 0, 0),
+        0
+    ),
+    mushyConstant_
+    (
+        "mushyConstant",
+        dimensionSet(1, -3, -1, 0, 0, 0, 0),
+        1e8
+    ),
+    mushyEpsilon_(1e-6),
+
+    spongeZStart_(0),
+    spongeZEnd_(0),
+    spongeTimeScale_(1e-5),
+
     momentumTransport
     (
         rho,
@@ -126,6 +353,8 @@ Foam::solvers::compressibleVoF_DED::compressibleVoF_DED(fvMesh& mesh)
     mixture(mixture_)
 {
     read();
+    updateInterfaceDelta();
+    updateMushyAndSpongeResistance();
 
     if (correctPhi || mesh.topoChanging())
     {
@@ -146,8 +375,6 @@ Foam::solvers::compressibleVoF_DED::compressibleVoF_DED(fvMesh& mesh)
 }
 
 
-// * * * * * * * * * * * * * * * * Destructor  * * * * * * * * * * * * * * * //
-
 Foam::solvers::compressibleVoF_DED::~compressibleVoF_DED()
 {}
 
@@ -156,6 +383,8 @@ Foam::solvers::compressibleVoF_DED::~compressibleVoF_DED()
 
 void Foam::solvers::compressibleVoF_DED::prePredictor()
 {
+    readDEDProperties();
+
     twoPhaseVoFSolver::prePredictor();
 
     const volScalarField& rho1 = mixture_.thermo1().rho();
@@ -166,17 +395,26 @@ void Foam::solvers::compressibleVoF_DED::prePredictor()
 
     rhoPhi = alphaRhoPhi1 + alphaRhoPhi2;
 
+    // Continuity residuals include Phase-C mass transfer metal→gas:
+    //   metal: S1 = -mDotEvap
+    //   gas:   S2 = +mDotEvap
+    // contErr = ddt + div - S
     contErr1 =
     (
         fvc::ddt(alpha1, rho1)()() + fvc::div(alphaRhoPhi1)()()
       - (fvModels().source(alpha1, rho1)&rho1)()
+      + mDotEvap_()
     );
 
     contErr2 =
     (
         fvc::ddt(alpha2, rho2)()() + fvc::div(alphaRhoPhi2)()()
       - (fvModels().source(alpha2, rho2)&rho2)()
+      - mDotEvap_()
     );
+
+    updateInterfaceDelta();
+    updateMushyAndSpongeResistance();
 }
 
 
@@ -201,6 +439,15 @@ void Foam::solvers::compressibleVoF_DED::momentumTransportCorrector()
 void Foam::solvers::compressibleVoF_DED::thermophysicalTransportCorrector()
 {
     thermophysicalTransport.correct();
+}
+
+
+void Foam::solvers::compressibleVoF_DED::postSolve()
+{
+    // Freeze time-level liquid fraction for next-step latent-heat ddt
+    fLiquidPrev_ == fLiquid_;
+
+    VoFSolver::postSolve();
 }
 
 

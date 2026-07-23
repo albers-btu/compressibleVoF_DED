@@ -8,50 +8,27 @@
 License
     This file is part of OpenFOAM.
 
-    OpenFOAM is free software: you can redistribute it and/or modify it
-    under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    OpenFOAM is distributed in the hope that it will be useful, but WITHOUT
-    ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
-    FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
-    for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with OpenFOAM.  If not, see <http://www.gnu.org/licenses/>.
-
 Class
     Foam::solvers::compressibleVoF_DED
 
 Description
-    Solver module for 2 compressible, non-isothermal immiscible fluids
-    using a VOF (volume of fluid) phase-fraction based interface capturing
-    approach, with optional mesh motion and mesh topology changes including
-    adaptive re-meshing.
+    Compressible two-phase VOF solver extended for DED / laser melt-pool
+    physics (Phase A–C):
 
-    The momentum and other fluid properties are of the "mixture" and a single
-    momentum equation is solved.
+    Base: OpenFOAM compressibleVoF + PIMPLE, dual compressible thermo.
 
-    Either mixture or two-phase transport modelling may be selected.  In the
-    mixture approach a single laminar, RAS or LES model is selected to model the
-    momentum stress.  In the Euler-Euler two-phase approach separate laminar,
-    RAS or LES selected models are selected for each of the phases.
+    Phase A: stable laser, radiation linearisation, continuous Psat,
+             under-relaxed evaporation / Marangoni / recoil.
 
-    Uses the flexible PIMPLE (PISO-SIMPLE) solution for time-resolved and
-    pseudo-transient and steady simulations.
+    Phase B: shared CSF interface measure, face Marangoni + recoil,
+             outer-corrector re-coupling, mushy/sponge fields.
 
-    Optional fvModels and fvConstraints are provided to enhance the simulation
-    in many ways including adding various sources, Lagrangian
-    particles, surface film etc. and constraining or limiting the solution.
+    Phase C: Picard latent-heat treatment, mass-conserving evaporation
+             (α + continuity), Beer–Lambert bulk laser absorption option.
 
 SourceFiles
     compressibleVoF_DED.C
-
-See also
-    Foam::solvers::VoFSolver
-    Foam::solvers::twoPhaseVoFSolver
-    Foam::solvers::incompressibleVoF_DED
+    DEDPhysics.C
 
 \*---------------------------------------------------------------------------*/
 
@@ -83,165 +60,187 @@ protected:
 
     // Phase properties
 
-        //- The compressible two-phase mixture
         compressibleTwoPhaseVoFMixture& mixture_;
 
 
     // Thermophysical properties
 
-        //- Reference to the mixture static pressure field
         volScalarField& p;
-
-        //- Compressibility source
         volScalarField::Internal vDot;
-
-        //- Compressibility source stabilisation tolerance
         scalar vDotResidualAlpha;
 
 
     // Pressure reference
 
-        //- Pressure reference
         Foam::pressureReference pressureReference_;
 
 
     // Kinematic properties
 
-        // Phase-1 mass-flux
         surfaceScalarField alphaRhoPhi1;
-
-        // Phase-2 mass-flux
         surfaceScalarField alphaRhoPhi2;
-
-        //- Kinetic energy field
-        //  Used in the energy equation
         volScalarField K;
 
 
-    // Momentum transport
+    // DED / melt-pool fields
 
-        //- Momentum transport model
+        volScalarField pRecoil_;
+        volScalarField fLiquid_;
+        //- Liquid fraction at previous time level (for latent-heat ddt)
+        volScalarField fLiquidPrev_;
+        volVectorField marangoniForce_;
+        surfaceScalarField marangoniForcef_;
+        volScalarField gasSpongeResistance_;
+        volScalarField mushyResistance_;
+        volScalarField evaporationSink_;
+        //- Volumetric mass evaporation rate metal→gas [kg/m3/s]
+        volScalarField mDotEvap_;
+        volScalarField interfaceDelta_;
+        //- Laser volumetric power [W/m3] (diagnostic)
+        volScalarField Qlaser_;
+
+
+    // Cached DED model coefficients
+
+        scalar laserPower_;
+        scalar absorptivity_;
+        scalar laserSpeed_;
+        scalar xStart_;
+        scalar yStart_;
+        scalar laserRadius_;
+        scalar laserRampTime_;
+        scalar forceRelaxation_;
+        scalar evaporationRelaxation_;
+        scalar laserTopSurfaceBias_;
+        scalar laserMaxDeltaT_;
+        scalar laserMinIntegralFraction_;
+        scalar PsatMax_;
+        scalar TmaxEval_;
+        scalar boilSoftWidth_;
+        scalar alphaEvap_;
+        Switch limitEvapByLaser_;
+        Switch massConservingEvaporation_;
+        label nLatentCorrectors_;
+        scalar liquidFractionRelaxation_;
+        //- Beer–Lambert absorption length [m]; <=0 disables bulk absorption
+        scalar laserAbsorptionLength_;
+        //- Fraction of deposited power routed to bulk (rest surface); [0,1]
+        scalar laserBulkFraction_;
+
+        scalar solidusTemperature_;
+        scalar liquidusTemperature_;
+        scalar Tboil_;
+        scalar Lv_;
+        scalar Mv_;
+        scalar Rs_;
+        scalar emissivity_;
+        scalar Tamb_;
+
+        dimensionedScalar Lf_;
+        dimensionedScalar dSigma_dT_;
+        dimensionedScalar mushyConstant_;
+        scalar mushyEpsilon_;
+
+        scalar spongeZStart_;
+        scalar spongeZEnd_;
+        scalar spongeTimeScale_;
+
+
+    // Transport
+
         compressibleInterPhaseTransportModel momentumTransport;
-
-
-    // Thermophysical transport
-
-        //- Thermophysical transport model
         compressibleInterPhaseThermophysicalTransportModel
             thermophysicalTransport;
 
 
     // Cached temporary fields
 
-        //- Phase-1 continuity error
         tmp<volScalarField::Internal> contErr1;
-
-        //- Phase-2 continuity error
         tmp<volScalarField::Internal> contErr2;
 
 
     // Protected Member Functions
 
-        //- Read controls
         virtual bool read();
+        void readDEDProperties();
+        void updateInterfaceDelta();
+        void updateMushyAndSpongeResistance();
 
-        //- Return the pressure reference
+        //- Equilibrium liquid fraction from temperature
+        scalar liquidFraction(const scalar T) const;
+
+        //- dfL/dT for apparent heat capacity [1/K]
+        scalar dLiquidFraction_dT(const scalar T) const;
+
+        //- Update fLiquid_ from T with under-relaxation
+        void updateLiquidFraction(const volScalarField& T);
+
+        //- Build laser power density into Qlaser_
+        void updateLaserSource(const volScalarField& CvEff);
+
+        //- Evaporation energy sink + optional mass transfer rate
+        void updateEvaporation
+        (
+            const volScalarField& T,
+            const volScalarField& CvEff,
+            const volScalarField& rho1
+        );
+
+        //- Marangoni volumetric + CSF face force; recoil pressure
+        void updateSurfaceForces(const volScalarField& T);
+
         virtual const Foam::pressureReference& pressureReference() const
         {
             return pressureReference_;
         }
 
-        //- The fluid is incompressible if both phases are incompressible
         virtual bool incompressible() const
         {
             return mixture.incompressible();
         }
 
-        //- Compressible flow is divergent
         virtual bool divergent() const
         {
             return
                !incompressible()
              || fvModels().addsSupToField(mixture_.rho1().name())
-             || fvModels().addsSupToField(mixture_.rho2().name());
+             || fvModels().addsSupToField(mixture_.rho2().name())
+             || massConservingEvaporation_;
         }
 
-        //- Return the mixture compressibility/density
-        //  Used by CorrectPhi for compressible mixtures following mesh change
         virtual tmp<volScalarField> psiByRho() const
         {
             return mixture.psiByRho();
         }
 
-        //- Calculate the alpha equation sources
         virtual void alphaSuSp
         (
             tmp<volScalarField::Internal>& Su,
             tmp<volScalarField::Internal>& Sp
         );
 
-        //- Return the momentum equation stress term
         virtual tmp<fvVectorMatrix> divDevTau(volVectorField& U);
 
 public:
 
-    // Access to the physical state
-
-        //- The compressible two-phase mixture
         const compressibleTwoPhaseVoFMixture& mixture;
 
+        TypeName("compressibleVoF_DED");
 
-public:
-
-    //- Runtime type information
-    TypeName("compressibleVoF_DED");
-
-
-    // Constructors
-
-        //- Construct from region mesh
         compressibleVoF_DED(fvMesh& mesh);
-
-        //- Disallow default bitwise copy construction
         compressibleVoF_DED(const compressibleVoF_DED&) = delete;
+        virtual ~compressibleVoF_DED();
 
-
-    //- Destructor
-    virtual ~compressibleVoF_DED();
-
-
-    // Member Functions
-
-        //- Called at the start of the PIMPLE loop
         virtual void prePredictor();
-
-        //- Predict the momentum transport
         virtual void momentumTransportPredictor();
-
-        //- Predict thermophysical transport
         virtual void thermophysicalTransportPredictor();
-
-        //- Construct and optionally solve the momentum equation
         virtual void momentumPredictor();
-
-        //- Construct and solve the energy equation,
-        //  convert to temperature
-        //  and update thermophysical and transport properties
         virtual void thermophysicalPredictor();
-
-        //- Construct and solve the pressure equation in the PISO loop
         virtual void pressureCorrector();
-
-        //- Correct the momentum transport
         virtual void momentumTransportCorrector();
-
-        //- Correct the thermophysical transport
         virtual void thermophysicalTransportCorrector();
+        virtual void postSolve();
 
-
-    // Member Operators
-
-        //- Disallow default bitwise assignment
         void operator=(const compressibleVoF_DED&) = delete;
 };
 

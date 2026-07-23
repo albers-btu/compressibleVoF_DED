@@ -6,6 +6,7 @@ SOURCE += alphaSuSp.C
 SOURCE += momentumPredictor.C
 SOURCE += thermophysicalPredictor.C
 SOURCE += pressureCorrector.C
+SOURCE += DEDPhysics.C
 SOURCE += compressibleVoF_DED.C
 
 LIB = $(FOAM_USER_LIBBIN)/libcompressibleVoF_DED

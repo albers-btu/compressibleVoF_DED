@@ -25,6 +25,9 @@ License
 
 #include "compressibleVoF_DED.H"
 #include "fvmSup.H"
+#include "fvmDiv.H"
+#include "fvcSnGrad.H"
+#include "fvcReconstruct.H"
 
 // * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * * //
 
@@ -41,11 +44,59 @@ Foam::tmp<Foam::fvVectorMatrix> Foam::solvers::compressibleVoF_DED::divDevTau
 
 void Foam::solvers::compressibleVoF_DED::momentumPredictor()
 {
-    twoPhaseVoFSolver::momentumPredictor();
+    volVectorField& U = U_;
+
+    // Recompute mushy resistance with latest fLiquid (updated each outer
+    // corrector after thermophysicalPredictor) and current α / sponge.
+    updateMushyAndSpongeResistance();
+
+    tUEqn =
+    (
+        fvm::ddt(rho, U)
+      + fvm::div(rhoPhi, U)
+      + MRF.DDt(rho, U)
+      + divDevTau(U)
+      + fvm::Sp(mushyResistance_, U)
+      + fvm::Sp(gasSpongeResistance_, U)
+     ==
+        fvModels().source(rho, U)
+    );
+    fvVectorMatrix& UEqn = tUEqn.ref();
+
+    UEqn.relax();
+
+    fvConstraints().constrain(UEqn);
 
     if (pimple.momentumPredictor())
     {
+        // Normal CSF forces on faces; Marangoni as volumetric body force
+        solve
+        (
+            UEqn
+         ==
+            marangoniForce_
+          + fvc::reconstruct
+            (
+                (
+                    surfaceTensionForce()
+                  + fvc::interpolate(pRecoil_)*fvc::snGrad(alpha1)
+                  - buoyancy.ghf*fvc::snGrad(rho)
+                  - fvc::snGrad(p_rgh)
+                ) * mesh.magSf()
+            )
+        );
+
+        fvConstraints().constrain(U);
+
         K = 0.5*magSqr(U);
+    }
+
+    if (pimple.finalIter())
+    {
+        Info<< "DED momentum:"
+            << " max(mushyResistance)=" << gMax(mushyResistance_)
+            << " max(gasSpongeResistance)=" << gMax(gasSpongeResistance_)
+            << endl;
     }
 }
 

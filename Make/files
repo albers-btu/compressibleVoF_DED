@@ -6,6 +6,7 @@ alphaSuSp.C
 momentumPredictor.C
 thermophysicalPredictor.C
 pressureCorrector.C
+DEDPhysics.C
 compressibleVoF_DED.C
 
 LIB = $(FOAM_USER_LIBBIN)/libcompressibleVoF_DED
