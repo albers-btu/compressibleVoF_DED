@@ -17,6 +17,7 @@ License
 #include "fvcGrad.H"
 #include "fvcFlux.H"
 #include "constants.H"
+#include "Pstream.H"
 
 // * * * * * * * * * * * * * Protected Member Functions  * * * * * * * * * * //
 
@@ -262,33 +263,43 @@ void Foam::solvers::compressibleVoF_DED::updateLaserSource
     const scalar dt = max(runTime.deltaTValue(), SMALL);
 
     // -----------------------------------------------------------------
-    // Laser deposition is LOCALISED to the free surface (and a shallow
-    // layer below it).  Never heat the full metal column under the beam
-    // — that produces a vertical "needle" melt instead of a pool.
+    // Geometric free-surface laser (anti-donut / keyhole-ready):
+    //   - Deposit on geometric free surface (interface + metal|gas faces)
+    //     including crater floor — not only a global zFree CSF rim.
+    //   - Projected-area weight: max(n_metal→gas · e_up, n_min)
+    //     so crater bottom (n_z~1) gets heat; steep walls get less.
+    //   - Optional shallow Beer–Lambert bulk from LOCAL free-surface height.
+    //   - Per-cell ΔT cap with iterative redistribution of remaining power
+    //     so applied ≈ deposited (no silent power loss).
     // -----------------------------------------------------------------
 
-    // Free-surface height: top of metal (α > 0.5)
-    scalar zFree = -GREAT;
+    // Global metal top (diagnostics + gas-side clamp only)
+    scalar zMetalTop = -GREAT;
     forAll(alpha1, celli)
     {
         if (alpha1[celli] > 0.5)
         {
-            zFree = max(zFree, mesh.C()[celli].z());
+            zMetalTop = max(zMetalTop, mesh.C()[celli].z());
         }
     }
-    reduce(zFree, maxOp<scalar>());
-    if (zFree < -0.5*GREAT)
+    reduce(zMetalTop, maxOp<scalar>());
+    if (zMetalTop < -0.5*GREAT)
     {
-        zFree = 0.005;
+        zMetalTop = 0.005;
     }
 
-    // Max penetration below free surface for any volumetric deposition
-    // (a few absorption lengths, or a few cells if no bulk model)
     const scalar cellLenTyp = cbrt(gAverage(mesh.V()));
     const scalar zPen =
         (laserAbsorptionLength_ > SMALL)
       ? max(3.0*laserAbsorptionLength_, 2.0*cellLenTyp)
       : 3.0*cellLenTyp;
+
+    // Beam from +z downward; incidence uses upward unit e_up
+    const vector eUp(0, 0, 1);
+    // Minimum projected factor (walls keep a little heat; floor dominates)
+    const scalar nMinProj = 0.05;
+    // Optional soft blend with old top-bias (0 = pure projected area)
+    const scalar topBias = min(max(laserTopSurfaceBias_, 0.0), 1.0);
 
     // --- Horizontal Gaussian footprint (xy only) ---
     volScalarField gaussian
@@ -313,8 +324,117 @@ void Foam::solvers::compressibleVoF_DED::updateLaserSource
         gaussian[celli] = exp(-(dx*dx + dy*dy)/(2.0*sigma*sigma));
     }
 
-    // --- Surface weight: CSF free-surface measure only ---
-    // δ = 2 α (1-α) |∇α|  peaks at the metal/gas interface
+    // --- Geometric free-surface marker ---
+    // (A) mixed interface band, or (B) metal cell sharing a face with gas
+    boolList isFreeSurface(mesh.nCells(), false);
+
+    forAll(alpha1, celli)
+    {
+        const scalar a = min(max(alpha1[celli], 0.0), 1.0);
+        const scalar magGa = magGradAlpha[celli];
+        const scalar cellLen = cbrt(mesh.V()[celli]);
+
+        if (a > 0.02 && a < 0.98 && magGa*cellLen > 1e-6)
+        {
+            isFreeSurface[celli] = true;
+        }
+    }
+
+    {
+        const labelUList& own = mesh.owner();
+        const labelUList& nei = mesh.neighbour();
+
+        forAll(own, facei)
+        {
+            const label c0 = own[facei];
+            const label c1 = nei[facei];
+            const scalar a0 = min(max(alpha1[c0], 0.0), 1.0);
+            const scalar a1 = min(max(alpha1[c1], 0.0), 1.0);
+
+            // Metal | gas face → both sides treated as geometric free surface
+            // candidates; weight is applied only on metal-bearing cells below.
+            if ((a0 > 0.5 && a1 < 0.5) || (a1 > 0.5 && a0 < 0.5))
+            {
+                isFreeSurface[c0] = true;
+                isFreeSurface[c1] = true;
+            }
+        }
+
+        // Coupled processor patches: use boundary α
+        forAll(mesh.boundary(), patchi)
+        {
+            const fvPatch& patch = mesh.boundary()[patchi];
+            if (!patch.coupled())
+            {
+                continue;
+            }
+
+            const fvPatchScalarField& alphaPf =
+                alpha1.boundaryField()[patchi];
+            const labelUList& fc = patch.faceCells();
+
+            forAll(fc, facei)
+            {
+                const label c0 = fc[facei];
+                const scalar a0 = min(max(alpha1[c0], 0.0), 1.0);
+                const scalar aN = min(max(alphaPf[facei], 0.0), 1.0);
+
+                if ((a0 > 0.5 && aN < 0.5) || (a0 < 0.5 && aN > 0.5))
+                {
+                    isFreeSurface[c0] = true;
+                }
+            }
+        }
+    }
+
+    // Local free-surface height for bulk depth (only free-surface cells)
+    // Under the beam: use nearest FS sample in xy (all ranks) for each bulk cell.
+    DynamicList<label> fsCells(1024);
+    DynamicList<vector> fsCentersLocal(1024);
+
+    forAll(isFreeSurface, celli)
+    {
+        if (!isFreeSurface[celli] || gaussian[celli] < 1e-8)
+        {
+            continue;
+        }
+
+        const scalar a = min(max(alpha1[celli], 0.0), 1.0);
+        // Keep metal-bearing free-surface cells (crater floor + walls + flat)
+        if (a < 0.05)
+        {
+            continue;
+        }
+
+        fsCells.append(celli);
+        fsCentersLocal.append(mesh.C()[celli]);
+    }
+
+    // Parallel: bulk depth needs FS samples from every rank under the beam
+    List<vector> fsCenters;
+    {
+        List<List<vector>> gathered(Pstream::nProcs());
+        gathered[Pstream::myProcNo()] = fsCentersLocal;
+        Pstream::gatherList(gathered);
+        Pstream::scatterList(gathered);
+
+        label nAll = 0;
+        forAll(gathered, proci)
+        {
+            nAll += gathered[proci].size();
+        }
+        fsCenters.setSize(nAll);
+        label k = 0;
+        forAll(gathered, proci)
+        {
+            forAll(gathered[proci], i)
+            {
+                fsCenters[k++] = gathered[proci][i];
+            }
+        }
+    }
+
+    // --- Surface weight: geometric FS × projected area ---
     volScalarField surfaceWeight
     (
         IOobject
@@ -329,52 +449,56 @@ void Foam::solvers::compressibleVoF_DED::updateLaserSource
         dimensionedScalar("zero", dimless/dimLength, 0)
     );
 
-    forAll(surfaceWeight, celli)
+    forAll(fsCells, i)
     {
+        const label celli = fsCells[i];
         const scalar a = min(max(alpha1[celli], 0.0), 1.0);
         const scalar magGa = magGradAlpha[celli];
+        const scalar cellLen = cbrt(mesh.V()[celli]);
         const scalar z = mesh.C()[celli].z();
 
-        // Only deposit near free surface (not deep substrate / not high gas)
-        if (z < zFree - zPen || z > zFree + 2.0*cellLenTyp)
+        // Drop pure gas and cells far above the metal domain
+        if (a < 0.05 || z > zMetalTop + 2.0*cellLenTyp)
         {
             continue;
         }
 
-        scalar delta = 2.0*a*(1.0 - a)*magGa;
-        delta = max(delta, interfaceDelta_[celli]);
+        // Metal→gas normal; default upward on flat open metal
+        vector nHat = eUp;
+        if (magGa > VSMALL)
+        {
+            nHat = -gradAlpha[celli]/(magGa + VSMALL);
+            // Ensure outward from metal (prefer +z when ambiguous)
+            if ((nHat & eUp) < 0 && a > 0.5)
+            {
+                nHat = -nHat;
+            }
+        }
 
-        // Sharp MULES interfaces: also use |∇α| in the free-surface band
+        // Projected area facing the vertical beam
+        const scalar cosInc = max(nHat & eUp, nMinProj);
+
+        // Soft optional bias (legacy knob); projected area is primary
+        const scalar projWeight =
+            (1.0 - topBias)*cosInc
+          + topBias*max(cosInc, 0.25);
+
+        // Interface area density [1/m]
+        scalar delta = max(interfaceDelta_[celli], 2.0*a*(1.0 - a)*magGa);
         if (a > 0.02 && a < 0.98)
         {
             delta = max(delta, magGa);
         }
-
-        if (delta <= VSMALL)
+        // Pure-metal geometric FS (crater floor): compact 1/Δ kernel
+        if (delta <= VSMALL || a >= 0.98)
         {
-            continue;
+            delta = max(delta, 1.0/max(cellLen, SMALL));
         }
 
-        scalar topWeight = 1.0;
-        if (laserTopSurfaceBias_ > SMALL && magGa > VSMALL)
-        {
-            const vector nMetalToGas = -gradAlpha[celli]/(magGa + VSMALL);
-            // Soft upward bias — floor so weight cannot vanish
-            const scalar up = max(nMetalToGas.z(), 0.0);
-            topWeight =
-                max
-                (
-                    0.25,
-                    (1.0 - laserTopSurfaceBias_) + laserTopSurfaceBias_*up
-                );
-        }
-
-        surfaceWeight[celli] = delta*topWeight;
+        surfaceWeight[celli] = delta*projWeight;
     }
 
-    // --- Shallow Beer–Lambert bulk: depth measured DOWN from zFree ---
-    // Only for cells in metal below the free surface within zPen.
-    // (Old model used depth ~ (α-0.5)/|∇α| which is ~uniform in bulk → needle)
+    // --- Shallow Beer–Lambert bulk from LOCAL free-surface height ---
     volScalarField bulkWeight
     (
         IOobject
@@ -389,22 +513,54 @@ void Foam::solvers::compressibleVoF_DED::updateLaserSource
         dimensionedScalar("zero", dimless/dimLength, 0)
     );
 
-    if (laserAbsorptionLength_ > SMALL && laserBulkFraction_ > SMALL)
+    if
+    (
+        laserAbsorptionLength_ > SMALL
+     && laserBulkFraction_ > SMALL
+     && fsCenters.size()
+    )
     {
         const scalar mu = 1.0/laserAbsorptionLength_;
+        // Search radius in xy for matching a free-surface sample
+        const scalar rSearch = max(2.5*cellLenTyp, 0.5*laserRadius_);
+        const scalar rSearchSqr = rSearch*rSearch;
 
         forAll(bulkWeight, celli)
         {
             const scalar a = min(max(alpha1[celli], 0.0), 1.0);
-            const scalar z = mesh.C()[celli].z();
-
             if (a < 0.05 || gaussian[celli] < 1e-8)
             {
                 continue;
             }
 
-            // Depth into the metal from free surface (downward)
-            const scalar depth = zFree - z;
+            // Skip pure free-surface cells (handled by surface kernel)
+            if (isFreeSurface[celli] && a < 0.98)
+            {
+                continue;
+            }
+
+            const point& C = mesh.C()[celli];
+            scalar bestD2 = GREAT;
+            scalar zFs = C.z();
+
+            forAll(fsCenters, i)
+            {
+                const vector d = fsCenters[i] - C;
+                const scalar d2 = d.x()*d.x() + d.y()*d.y();
+                if (d2 < bestD2)
+                {
+                    bestD2 = d2;
+                    zFs = fsCenters[i].z();
+                }
+            }
+
+            if (bestD2 > rSearchSqr)
+            {
+                continue;
+            }
+
+            // Depth into metal from the local free surface (downward only)
+            const scalar depth = zFs - C.z();
             if (depth < 0 || depth > zPen)
             {
                 continue;
@@ -414,10 +570,9 @@ void Foam::solvers::compressibleVoF_DED::updateLaserSource
         }
     }
 
-    // Blend: mostly free-surface CSF, optional shallow bulk
     const scalar fb =
         (laserAbsorptionLength_ > SMALL ? max(laserBulkFraction_, 0.0) : 0.0);
-    const scalar fs = max(1.0 - fb, 0.0);
+    const scalar fSurf = max(1.0 - fb, 0.0);
 
     volScalarField weight
     (
@@ -429,11 +584,10 @@ void Foam::solvers::compressibleVoF_DED::updateLaserSource
             IOobject::NO_READ,
             IOobject::NO_WRITE
         ),
-        gaussian*(fs*surfaceWeight + fb*bulkWeight)
+        gaussian*(fSurf*surfaceWeight + fb*bulkWeight)
     );
 
-    // If free-surface measure is too weak, fall back to a SHALLOW surface
-    // layer under the beam — never the full metal column.
+    // Fallback: compact geometric metal layer under the beam
     {
         scalar surfInt = 0.0;
         forAll(weight, celli)
@@ -445,38 +599,51 @@ void Foam::solvers::compressibleVoF_DED::updateLaserSource
         if (surfInt < SMALL)
         {
             weight = dimensionedScalar("zero", dimless/dimLength, 0);
+
             forAll(weight, celli)
             {
                 const scalar a = min(max(alpha1[celli], 0.0), 1.0);
-                const scalar z = mesh.C()[celli].z();
-                if
-                (
-                    gaussian[celli] > 1e-6
-                 && a > 0.05
-                 && z >= zFree - zPen
-                 && z <= zFree + 2.0*cellLenTyp
-                )
+                if (gaussian[celli] < 1e-6 || a < 0.05)
                 {
-                    // Compact surface kernel ~ 1/cell near free surface
-                    const scalar depth = max(zFree - z, 0.0);
-                    weight[celli] =
-                        gaussian[celli]*a
-                       *exp(-depth/max(zPen, SMALL))
-                       /max(cellLenTyp, SMALL);
+                    continue;
+                }
+
+                if (isFreeSurface[celli] || a > 0.5)
+                {
+                    const scalar cellLen = cbrt(mesh.V()[celli]);
+                    const scalar depth = max(zMetalTop - mesh.C()[celli].z(), 0.0);
+                    if (depth <= zPen)
+                    {
+                        weight[celli] =
+                            gaussian[celli]*a
+                           *exp(-depth/max(zPen, SMALL))
+                           /max(cellLen, SMALL);
+                    }
                 }
             }
         }
     }
 
-    // Zero any residual weight deep in the substrate / high in gas
-    forAll(weight, celli)
+    // --- Power scale + per-cell cap with redistribution ---
+    // Cap: Q ≤ ρ Cv ΔT_max / Δt
+    // If a cell saturates, remaining power is re-scaled onto unsaturated cells
+    // so the beam energy is conserved whenever any capacity remains.
+    const volScalarField& Cv2 = mixture.thermo2().Cv();
+
+    scalarField maxQ(mesh.nCells(), 0.0);
+    forAll(maxQ, celli)
     {
-        const scalar z = mesh.C()[celli].z();
-        if (z < zFree - zPen || z > zFree + 2.0*cellLenTyp)
-        {
-            weight[celli] = 0.0;
-        }
+        const scalar a = min(max(alpha1[celli], 0.0), 1.0);
+        const scalar CvMix = a*CvEff[celli] + (1.0 - a)*Cv2[celli];
+        maxQ[celli] = rho[celli]*max(CvMix, SMALL)*laserMaxDeltaT_/dt;
     }
+
+    Qlaser_ = dimensionedScalar
+    (
+        "zero",
+        dimensionSet(1, -1, -3, 0, 0, 0, 0),
+        0
+    );
 
     scalar sourceIntegral = 0.0;
     forAll(weight, celli)
@@ -485,41 +652,105 @@ void Foam::solvers::compressibleVoF_DED::updateLaserSource
     }
     reduce(sourceIntegral, sumOp<scalar>());
 
-    // sourceIntegral = ∫ weight dV ~ area (δ ~ 1/length)
-    // If weight exists, scale so full depositedPower is applied.
-    // Only skip deposition when the kernel is essentially empty.
-    scalar scaleVal = 0.0;
-    if (sourceIntegral > SMALL)
-    {
-        scaleVal = depositedPower/sourceIntegral;
-    }
-
-    const dimensionedScalar scale
-    (
-        "scale",
-        dimensionSet(1, 0, -3, 0, 0, 0, 0),
-        scaleVal
-    );
-
-    Qlaser_ = scale*weight;
-
-    // For logging
     const scalar safeIntegral = max(sourceIntegral, SMALL);
 
-    // Per-cell power density cap
-    const volScalarField& Cv2 = mixture.thermo2().Cv();
-    label nLaserLimited = 0;
+    boolList saturated(mesh.nCells(), false);
 
+    // Iterative assignment:
+    //   remaining = deposited − power locked on saturated cells
+    //   unsaturated Q = min(remaining/∫w_free · w, maxQ)
+    // Newly saturated cells lock at maxQ; leftover is redistributed.
+    const label nRedistrib = 8;
+    for (label iter = 0; iter < nRedistrib; ++iter)
+    {
+        scalar powerOnSat = 0.0;
+        scalar freeIntegral = 0.0;
+
+        forAll(weight, celli)
+        {
+            if (weight[celli] <= VSMALL)
+            {
+                continue;
+            }
+
+            if (saturated[celli])
+            {
+                powerOnSat += maxQ[celli]*mesh.V()[celli];
+            }
+            else
+            {
+                freeIntegral += weight[celli]*mesh.V()[celli];
+            }
+        }
+        reduce(powerOnSat, sumOp<scalar>());
+        reduce(freeIntegral, sumOp<scalar>());
+
+        const scalar remainingPower =
+            max(depositedPower - powerOnSat, 0.0);
+
+        if (remainingPower <= SMALL*max(depositedPower, 1.0) || freeIntegral <= SMALL)
+        {
+            // Clear any stale unsaturated Q if no free capacity
+            if (freeIntegral <= SMALL)
+            {
+                forAll(weight, celli)
+                {
+                    if (!saturated[celli])
+                    {
+                        Qlaser_[celli] = 0;
+                    }
+                }
+            }
+            break;
+        }
+
+        const scalar scaleVal = remainingPower/freeIntegral;
+        label nNewSat = 0;
+
+        forAll(weight, celli)
+        {
+            if (weight[celli] <= VSMALL)
+            {
+                Qlaser_[celli] = 0;
+                continue;
+            }
+
+            if (saturated[celli])
+            {
+                Qlaser_[celli] = maxQ[celli];
+                continue;
+            }
+
+            const scalar qTry = scaleVal*weight[celli];
+            if (qTry >= maxQ[celli]*(1.0 - 1e-12))
+            {
+                Qlaser_[celli] = maxQ[celli];
+                saturated[celli] = true;
+                ++nNewSat;
+            }
+            else
+            {
+                Qlaser_[celli] = qTry;
+            }
+        }
+        reduce(nNewSat, sumOp<label>());
+
+        if (nNewSat == 0)
+        {
+            break;
+        }
+    }
+
+    // Count limited cells for logging
+    label nLaserLimited = 0;
     forAll(Qlaser_, celli)
     {
-        const scalar a = min(max(alpha1[celli], 0.0), 1.0);
-        const scalar CvMix = a*CvEff[celli] + (1.0 - a)*Cv2[celli];
-        const scalar maxQ =
-            rho[celli]*max(CvMix, SMALL)*laserMaxDeltaT_/dt;
-
-        if (Qlaser_[celli] > maxQ)
+        if
+        (
+            weight[celli] > VSMALL
+         && Qlaser_[celli] >= (1.0 - 1e-6)*maxQ[celli]
+        )
         {
-            Qlaser_[celli] = maxQ;
             ++nLaserLimited;
         }
     }
@@ -543,6 +774,7 @@ void Foam::solvers::compressibleVoF_DED::updateLaserSource
             << " safeIntegral=" << safeIntegral
             << " bulkLen=" << laserAbsorptionLength_
             << " nLimited=" << nLaserLimited
+            << " nFS=" << returnReduce(label(fsCells.size()), sumOp<label>())
             << " xLaser=" << xLaser
             << endl;
     }
