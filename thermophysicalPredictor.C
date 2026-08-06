@@ -161,6 +161,7 @@ void Foam::solvers::compressibleVoF_DED::thermophysicalPredictor()
 
         updateLaserSource(CvEff);
         updateEvaporation(T, CvEff, rho1);
+        updatePowderSource(T);
 
         scalar maxDT = 0.0;
         label nHeated = 0;
@@ -185,10 +186,12 @@ void Foam::solvers::compressibleVoF_DED::thermophysicalPredictor()
                *(pow4(Tc) - pow4(Tamb_))*delta
               : 0.0;
 
+            // powderHeat: enthalpy of added metal (often a sink for cold powder)
             const scalar qNet =
                 Qlaser_[celli]
               - qRad
-              - evaporationSink_[celli];
+              - evaporationSink_[celli]
+              + powderHeat_[celli];
 
             if (mag(qNet) < VSMALL)
             {

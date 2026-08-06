@@ -18,6 +18,7 @@ License
 #include "fvcFlux.H"
 #include "constants.H"
 #include "Pstream.H"
+#include "meshSearch.H"
 
 // * * * * * * * * * * * * * Protected Member Functions  * * * * * * * * * * //
 
@@ -95,6 +96,67 @@ void Foam::solvers::compressibleVoF_DED::readDEDProperties()
     laserBulkFraction_ =
         laserProperties.lookupOrDefault<scalar>("laserBulkFraction", 0.25);
     laserBulkFraction_ = min(max(laserBulkFraction_, 0.0), 1.0);
+
+    laserModel_ =
+        laserProperties.lookupOrDefault<word>("laserModel", "rayTrace");
+    nRaySide_ =
+        max(laserProperties.lookupOrDefault<label>("nRaySide", 32), 4);
+    maxLaserReflections_ =
+        max
+        (
+            laserProperties.lookupOrDefault<label>("maxLaserReflections", 3),
+            0
+        );
+    laserRayStepFraction_ =
+        laserProperties.lookupOrDefault<scalar>("laserRayStepFraction", 0.35);
+    laserRayOriginZ_ =
+        laserProperties.lookupOrDefault<scalar>
+        (
+            "laserRayOriginZ",
+            -GREAT
+        );
+    laserMinCosIncidence_ =
+        laserProperties.lookupOrDefault<scalar>
+        (
+            "laserMinCosIncidence",
+            0.05
+        );
+
+    // Continuum powder / material addition
+    powderEnabled_ =
+        laserProperties.lookupOrDefault<Switch>("powderEnabled", false);
+    powderFeedRate_ =
+        laserProperties.lookupOrDefault<scalar>("powderFeedRate", 0.0);
+    powderCatchEfficiency_ =
+        min
+        (
+            max
+            (
+                laserProperties.lookupOrDefault<scalar>
+                (
+                    "powderCatchEfficiency",
+                    0.7
+                ),
+                0.0
+            ),
+            1.0
+        );
+    powderTemperature_ =
+        laserProperties.lookupOrDefault<scalar>("powderTemperature", 300.0);
+    powderRadius_ =
+        laserProperties.lookupOrDefault<scalar>("powderRadius", -1.0);
+    if (powderRadius_ <= SMALL)
+    {
+        powderRadius_ = laserRadius_;
+    }
+    powderMinLiquidFraction_ =
+        laserProperties.lookupOrDefault<scalar>
+        (
+            "powderMinLiquidFraction",
+            0.1
+        );
+    powderSolid_ =
+        laserProperties.lookupOrDefault<Switch>("powderSolid", true);
 
     solidusTemperature_ =
         laserProperties.lookup<scalar>("solidusTemperature");
@@ -244,6 +306,162 @@ void Foam::solvers::compressibleVoF_DED::updateLiquidFraction
 
 
 void Foam::solvers::compressibleVoF_DED::updateLaserSource
+(
+    const volScalarField& CvEff
+)
+{
+    if (laserModel_ == "rayTrace" || laserModel_ == "ray")
+    {
+        updateLaserSourceRayTrace(CvEff);
+    }
+    else
+    {
+        // "geometric" (default fallback name) or any other word
+        updateLaserSourceGeometric(CvEff);
+    }
+}
+
+
+void Foam::solvers::compressibleVoF_DED::redistributeLaserPower
+(
+    const volScalarField& CvEff,
+    const scalar depositedPower,
+    const scalar dt,
+    label& nLaserLimited
+)
+{
+    // Cap: Q ≤ ρ Cv ΔT_max / Δt
+    // Leftover power after saturation is reassigned to unsaturated cells.
+    const volScalarField& Cv2 = mixture.thermo2().Cv();
+
+    scalarField maxQ(mesh.nCells(), 0.0);
+    forAll(maxQ, celli)
+    {
+        const scalar a = min(max(alpha1[celli], 0.0), 1.0);
+        const scalar CvMix = a*CvEff[celli] + (1.0 - a)*Cv2[celli];
+        maxQ[celli] = rho[celli]*max(CvMix, SMALL)*laserMaxDeltaT_/dt;
+    }
+
+    // Treat current Qlaser_ as an unnormalized weight field (power density).
+    // Convert to weights proportional to Q*V for redistribution of depositedPower.
+    scalarField weight(mesh.nCells(), 0.0);
+    forAll(weight, celli)
+    {
+        weight[celli] = max(Qlaser_[celli], 0.0);
+    }
+
+    Qlaser_ = dimensionedScalar
+    (
+        "zero",
+        dimensionSet(1, -1, -3, 0, 0, 0, 0),
+        0
+    );
+
+    boolList saturated(mesh.nCells(), false);
+    const label nRedistrib = 8;
+
+    for (label iter = 0; iter < nRedistrib; ++iter)
+    {
+        scalar powerOnSat = 0.0;
+        scalar freeIntegral = 0.0;
+
+        forAll(weight, celli)
+        {
+            if (weight[celli] <= VSMALL)
+            {
+                continue;
+            }
+
+            if (saturated[celli])
+            {
+                powerOnSat += maxQ[celli]*mesh.V()[celli];
+            }
+            else
+            {
+                freeIntegral += weight[celli]*mesh.V()[celli];
+            }
+        }
+        reduce(powerOnSat, sumOp<scalar>());
+        reduce(freeIntegral, sumOp<scalar>());
+
+        const scalar remainingPower =
+            max(depositedPower - powerOnSat, 0.0);
+
+        if
+        (
+            remainingPower <= SMALL*max(depositedPower, 1.0)
+         || freeIntegral <= SMALL
+        )
+        {
+            if (freeIntegral <= SMALL)
+            {
+                forAll(weight, celli)
+                {
+                    if (!saturated[celli])
+                    {
+                        Qlaser_[celli] = 0;
+                    }
+                }
+            }
+            break;
+        }
+
+        const scalar scaleVal = remainingPower/freeIntegral;
+        label nNewSat = 0;
+
+        forAll(weight, celli)
+        {
+            if (weight[celli] <= VSMALL)
+            {
+                Qlaser_[celli] = 0;
+                continue;
+            }
+
+            if (saturated[celli])
+            {
+                Qlaser_[celli] = maxQ[celli];
+                continue;
+            }
+
+            const scalar qTry = scaleVal*weight[celli];
+            if (qTry >= maxQ[celli]*(1.0 - 1e-12))
+            {
+                Qlaser_[celli] = maxQ[celli];
+                saturated[celli] = true;
+                ++nNewSat;
+            }
+            else
+            {
+                Qlaser_[celli] = qTry;
+            }
+        }
+        reduce(nNewSat, sumOp<label>());
+
+        if (nNewSat == 0)
+        {
+            break;
+        }
+    }
+
+    nLaserLimited = 0;
+    forAll(Qlaser_, celli)
+    {
+        if
+        (
+            weight[celli] > VSMALL
+         && Qlaser_[celli] >= (1.0 - 1e-6)*maxQ[celli]
+        )
+        {
+            ++nLaserLimited;
+        }
+    }
+    reduce(nLaserLimited, sumOp<label>());
+
+    Qlaser_.correctBoundaryConditions();
+}
+
+
+void Foam::solvers::compressibleVoF_DED::updateLaserSourceGeometric
 (
     const volScalarField& CvEff
 )
@@ -624,26 +842,18 @@ void Foam::solvers::compressibleVoF_DED::updateLaserSource
         }
     }
 
-    // --- Power scale + per-cell cap with redistribution ---
-    // Cap: Q ≤ ρ Cv ΔT_max / Δt
-    // If a cell saturates, remaining power is re-scaled onto unsaturated cells
-    // so the beam energy is conserved whenever any capacity remains.
-    const volScalarField& Cv2 = mixture.thermo2().Cv();
-
-    scalarField maxQ(mesh.nCells(), 0.0);
-    forAll(maxQ, celli)
-    {
-        const scalar a = min(max(alpha1[celli], 0.0), 1.0);
-        const scalar CvMix = a*CvEff[celli] + (1.0 - a)*Cv2[celli];
-        maxQ[celli] = rho[celli]*max(CvMix, SMALL)*laserMaxDeltaT_/dt;
-    }
-
+    // Seed Qlaser_ with weight (power density shape); redistribute to
+    // conserve depositedPower under per-cell thermal caps.
     Qlaser_ = dimensionedScalar
     (
         "zero",
         dimensionSet(1, -1, -3, 0, 0, 0, 0),
         0
     );
+    forAll(Qlaser_, celli)
+    {
+        Qlaser_[celli] = weight[celli];
+    }
 
     scalar sourceIntegral = 0.0;
     forAll(weight, celli)
@@ -651,112 +861,10 @@ void Foam::solvers::compressibleVoF_DED::updateLaserSource
         sourceIntegral += weight[celli]*mesh.V()[celli];
     }
     reduce(sourceIntegral, sumOp<scalar>());
-
     const scalar safeIntegral = max(sourceIntegral, SMALL);
 
-    boolList saturated(mesh.nCells(), false);
-
-    // Iterative assignment:
-    //   remaining = deposited − power locked on saturated cells
-    //   unsaturated Q = min(remaining/∫w_free · w, maxQ)
-    // Newly saturated cells lock at maxQ; leftover is redistributed.
-    const label nRedistrib = 8;
-    for (label iter = 0; iter < nRedistrib; ++iter)
-    {
-        scalar powerOnSat = 0.0;
-        scalar freeIntegral = 0.0;
-
-        forAll(weight, celli)
-        {
-            if (weight[celli] <= VSMALL)
-            {
-                continue;
-            }
-
-            if (saturated[celli])
-            {
-                powerOnSat += maxQ[celli]*mesh.V()[celli];
-            }
-            else
-            {
-                freeIntegral += weight[celli]*mesh.V()[celli];
-            }
-        }
-        reduce(powerOnSat, sumOp<scalar>());
-        reduce(freeIntegral, sumOp<scalar>());
-
-        const scalar remainingPower =
-            max(depositedPower - powerOnSat, 0.0);
-
-        if (remainingPower <= SMALL*max(depositedPower, 1.0) || freeIntegral <= SMALL)
-        {
-            // Clear any stale unsaturated Q if no free capacity
-            if (freeIntegral <= SMALL)
-            {
-                forAll(weight, celli)
-                {
-                    if (!saturated[celli])
-                    {
-                        Qlaser_[celli] = 0;
-                    }
-                }
-            }
-            break;
-        }
-
-        const scalar scaleVal = remainingPower/freeIntegral;
-        label nNewSat = 0;
-
-        forAll(weight, celli)
-        {
-            if (weight[celli] <= VSMALL)
-            {
-                Qlaser_[celli] = 0;
-                continue;
-            }
-
-            if (saturated[celli])
-            {
-                Qlaser_[celli] = maxQ[celli];
-                continue;
-            }
-
-            const scalar qTry = scaleVal*weight[celli];
-            if (qTry >= maxQ[celli]*(1.0 - 1e-12))
-            {
-                Qlaser_[celli] = maxQ[celli];
-                saturated[celli] = true;
-                ++nNewSat;
-            }
-            else
-            {
-                Qlaser_[celli] = qTry;
-            }
-        }
-        reduce(nNewSat, sumOp<label>());
-
-        if (nNewSat == 0)
-        {
-            break;
-        }
-    }
-
-    // Count limited cells for logging
     label nLaserLimited = 0;
-    forAll(Qlaser_, celli)
-    {
-        if
-        (
-            weight[celli] > VSMALL
-         && Qlaser_[celli] >= (1.0 - 1e-6)*maxQ[celli]
-        )
-        {
-            ++nLaserLimited;
-        }
-    }
-    reduce(nLaserLimited, sumOp<label>());
-
-    Qlaser_.correctBoundaryConditions();
+    redistributeLaserPower(CvEff, depositedPower, dt, nLaserLimited);
 
     if (debug || pimple.finalIter())
     {
@@ -767,7 +875,7 @@ void Foam::solvers::compressibleVoF_DED::updateLaserSource
         }
         reduce(appliedPower, sumOp<scalar>());
 
-        Info<< "DED laser:"
+        Info<< "DED laser (geometric):"
             << " powerFactor=" << powerFactor
             << " deposited=" << depositedPower
             << " applied=" << appliedPower
@@ -776,6 +884,420 @@ void Foam::solvers::compressibleVoF_DED::updateLaserSource
             << " nLimited=" << nLaserLimited
             << " nFS=" << returnReduce(label(fsCells.size()), sumOp<label>())
             << " xLaser=" << xLaser
+            << endl;
+    }
+}
+
+
+void Foam::solvers::compressibleVoF_DED::updateLaserSourceRayTrace
+(
+    const volScalarField& CvEff
+)
+{
+    // -----------------------------------------------------------------
+    // Ray-traced laser — energy-conserving physics
+    //
+    // Beam: incident power P_inc = laserPower * ramp (NOT pre-scaled by A).
+    // At each free-surface hit (opaque-metal partition):
+    //   μ = max(−d·n, 0)   (n = metal→gas)
+    //   A(θ) = A0 * μ_eff   with μ_eff = max(μ, μ_min)  → A(normal)=A0
+    //   I_abs  = A * I      deposited in metal (Beer–Lambert skin)
+    //   I_refl = (1−A) * I  continues for multi-reflection
+    //
+    // MPI: every rank marches geometrically, but ONLY the rank that owns
+    // the global first hit (min path length) may deposit for that segment.
+    // That prevents double-counting when partitions split free surface/bulk.
+    //
+    // Thermal ΔT caps (redistributeLaserPower) are numerical safety only.
+    // -----------------------------------------------------------------
+
+    scalar powerFactor = 1.0;
+    if (laserRampTime_ > SMALL)
+    {
+        powerFactor = min(1.0, runTime.value()/laserRampTime_);
+    }
+
+    const scalar incidentPower = laserPower_*powerFactor;
+    const scalar xLaser = xStart_ + laserSpeed_*runTime.value();
+    const scalar sigma = max(laserRadius_/3.0, SMALL);
+    const scalar dt = max(runTime.deltaTValue(), SMALL);
+    const label myProci = Pstream::myProcNo();
+
+    const volVectorField gradAlpha(fvc::grad(alpha1));
+    const volScalarField magGradAlpha(mag(gradAlpha));
+
+    // Global domain bounds
+    const boundBox& bb = mesh.bounds();
+    scalar zTop = bb.max().z();
+    scalar zBot = bb.min().z();
+    reduce(zTop, maxOp<scalar>());
+    reduce(zBot, minOp<scalar>());
+
+    scalar zOrigin = laserRayOriginZ_;
+    if (zOrigin < -0.5*GREAT)
+    {
+        zOrigin = zTop - SMALL;
+    }
+
+    const scalar cellLenTyp = cbrt(gAverage(mesh.V()));
+    const scalar ds =
+        max(laserRayStepFraction_*cellLenTyp, 0.1*cellLenTyp);
+    const scalar maxPath = 2.0*mag(zTop - zBot) + 4.0*laserRadius_;
+    const label maxSteps = max(label(maxPath/ds) + 10, 50);
+
+    const label nSide = nRaySide_;
+    const label nRays = nSide*nSide;
+    const scalar halfW = 3.0*sigma;
+
+    List<scalar> rayW(nRays, 0.0);
+    List<vector> rayOrig(nRays, vector::zero);
+    const vector d0(0, 0, -1);
+
+    scalar wSum = 0.0;
+    label ri = 0;
+    for (label j = 0; j < nSide; ++j)
+    {
+        const scalar fy = (nSide == 1) ? 0.5 : scalar(j)/(nSide - 1);
+        const scalar y = yStart_ + (fy - 0.5)*2.0*halfW;
+
+        for (label i = 0; i < nSide; ++i)
+        {
+            const scalar fx = (nSide == 1) ? 0.5 : scalar(i)/(nSide - 1);
+            const scalar x = xLaser + (fx - 0.5)*2.0*halfW;
+            const scalar dx = x - xLaser;
+            const scalar dy = y - yStart_;
+            const scalar G = exp(-(dx*dx + dy*dy)/(2.0*sigma*sigma));
+
+            rayW[ri] = G;
+            rayOrig[ri] = vector(x, y, zOrigin);
+            wSum += G;
+            ++ri;
+        }
+    }
+
+    if (wSum <= SMALL || incidentPower <= SMALL)
+    {
+        Qlaser_ = dimensionedScalar
+        (
+            "zero",
+            dimensionSet(1, -1, -3, 0, 0, 0, 0),
+            0
+        );
+        return;
+    }
+
+    // Normalise weights → each ray carries a fraction of incident power
+    forAll(rayW, i)
+    {
+        rayW[i] = incidentPower*(rayW[i]/wSum);
+    }
+
+    scalarField powerCell(mesh.nCells(), 0.0);
+    const meshSearch& searchEng = meshSearch::New(mesh);
+
+    label nHitsLocal = 0;
+    label nReflectLocal = 0;
+    label nSegments = 0;
+
+    // One segment = one straight path (first arrival or after a reflection).
+    // max segments per ray = 1 + maxLaserReflections_
+    const label nSegMax = maxLaserReflections_ + 1;
+
+    for (label rayI = 0; rayI < nRays; ++rayI)
+    {
+        scalar Iray = rayW[rayI];
+        if (Iray <= SMALL)
+        {
+            continue;
+        }
+
+        point p0 = rayOrig[rayI];
+        vector d = d0;
+
+        for (label seg = 0; seg < nSegMax && Iray > SMALL; ++seg)
+        {
+            ++nSegments;
+
+            // ---- Pass A: local first free-surface / gas→metal hit ----
+            scalar localT = GREAT;
+            label localCell = -1;
+            point localHit = p0;
+            vector localN(0, 0, 1);
+
+            {
+                point p = p0;
+                scalar prevA = -1.0;
+                scalar t = 0.0;
+
+                for (label s = 0; s < maxSteps; ++s)
+                {
+                    p += d*ds;
+                    t += ds;
+
+                    if (p.z() < zBot - ds || p.z() > zTop + 2*ds)
+                    {
+                        break;
+                    }
+
+                    const label celli = searchEng.findCell(p);
+                    if (celli < 0)
+                    {
+                        // Keep prevA (do not invent a new "first entry"
+                        // when re-entering another partition's bulk).
+                        continue;
+                    }
+
+                    const scalar a = min(max(alpha1[celli], 0.0), 1.0);
+                    const scalar cellLen = cbrt(mesh.V()[celli]);
+                    const scalar magGa = magGradAlpha[celli];
+
+                    // True free-surface / gas→metal crossing only
+                    const bool gasToMetal =
+                        (prevA >= 0.0 && prevA < 0.4 && a >= 0.4);
+
+                    const bool interfaceBand =
+                        (a > 0.2 && a < 0.95)
+                     && (magGa*cellLen > 1e-4)
+                     && (prevA >= 0.0 && prevA < 0.5);
+
+                    if (gasToMetal || interfaceBand)
+                    {
+                        localT = t;
+                        localCell = celli;
+                        localHit = p;
+
+                        if (magGa > VSMALL)
+                        {
+                            localN = -gradAlpha[celli]/(magGa + VSMALL);
+                            if ((localN & (-d)) < 0)
+                            {
+                                localN = -localN;
+                            }
+                        }
+                        else
+                        {
+                            localN = -d;
+                        }
+                        break;
+                    }
+
+                    prevA = a;
+                }
+            }
+
+            // ---- Global first-hit ownership (min path length) ----
+            scalar globalT = localT;
+            reduce(globalT, minOp<scalar>());
+
+            // Tie-break: lowest rank among those with localT ≈ globalT
+            label ownerProci = labelMax;
+            if (localCell >= 0 && localT <= globalT*(1.0 + 1e-9) + SMALL)
+            {
+                ownerProci = myProci;
+            }
+            reduce(ownerProci, minOp<label>());
+
+            const bool iOwnHit =
+                (globalT < 0.5*GREAT)
+             && (localCell >= 0)
+             && (myProci == ownerProci)
+             && (localT <= globalT*(1.0 + 1e-9) + SMALL);
+
+            if (globalT >= 0.5*GREAT)
+            {
+                // Ray missed the free surface everywhere
+                break;
+            }
+
+            // Reconstruct hit geometry on non-owner ranks for reflection
+            // (owner broadcasts hit point, normal, and A via reductions)
+            vector hitP = localHit;
+            vector nHat = localN;
+            if (!iOwnHit)
+            {
+                hitP = vector::zero;
+                nHat = vector::zero;
+            }
+            reduce(hitP, sumOp<vector>());
+            reduce(nHat, sumOp<vector>());
+            if (mag(nHat) > SMALL)
+            {
+                nHat /= mag(nHat);
+            }
+            else
+            {
+                nHat = -d;
+            }
+            if (!iOwnHit)
+            {
+                // Non-owners zeroed hitP; after sum only owner contributed
+                // hitP is correct globally.
+            }
+
+            // Angle-aware absorptivity: A(n) = A0 * μ_eff  (A = A0 at normal)
+            const scalar mu = max((-d) & nHat, 0.0);
+            const scalar muEff = max(mu, laserMinCosIncidence_);
+            const scalar A =
+                min(max(absorptivity_*muEff, 0.0), 0.99);
+
+            const scalar Iabs = A*Iray;
+            const scalar Irefl = (1.0 - A)*Iray;
+
+            // ---- Deposit Iabs in metal (owner only) via Beer–Lambert ----
+            // Integrates to ≤ Iabs; leftover stays in the hit cell so energy
+            // is conserved on this rank (no silent loss, no extra creation).
+            if (iOwnHit && Iabs > SMALL)
+            {
+                ++nHitsLocal;
+
+                const scalar Labs =
+                    (laserAbsorptionLength_ > SMALL)
+                  ? laserAbsorptionLength_
+                  : max(cellLenTyp, SMALL);
+                const scalar muAbs = 1.0/Labs;
+
+                // Collect local metal samples along the transmitted ray
+                DynamicList<label> blCells(16);
+                DynamicList<scalar> blW(16);
+                scalar wSumBL = 0.0;
+
+                // Always include the hit cell
+                {
+                    const scalar w0 = 1.0;
+                    blCells.append(localCell);
+                    blW.append(w0);
+                    wSumBL += w0;
+                }
+
+                point pb = localHit;
+                const label nBulk = max(label(4.0*Labs/ds), 3);
+                for (label b = 0; b < nBulk; ++b)
+                {
+                    pb += d*ds;
+                    const label cB = searchEng.findCell(pb);
+                    if (cB < 0)
+                    {
+                        break;
+                    }
+                    const scalar aB = min(max(alpha1[cB], 0.0), 1.0);
+                    if (aB < 0.15)
+                    {
+                        break;
+                    }
+
+                    // Weight ∝ α * exp(−μ s) * ds  (Beer–Lambert kernel)
+                    const scalar s = (b + 1)*ds;
+                    const scalar w =
+                        aB*exp(-muAbs*s)*ds;
+                    if (w > VSMALL)
+                    {
+                        blCells.append(cB);
+                        blW.append(w);
+                        wSumBL += w;
+                    }
+                }
+
+                if (wSumBL > SMALL)
+                {
+                    forAll(blCells, k)
+                    {
+                        powerCell[blCells[k]] += Iabs*(blW[k]/wSumBL);
+                    }
+                }
+                else
+                {
+                    powerCell[localCell] += Iabs;
+                }
+            }
+
+            // ---- Multi-reflection: continue with Irefl ----
+            if (Irefl <= SMALL || seg >= maxLaserReflections_)
+            {
+                break;
+            }
+
+            // Reflect on all ranks with the same (global) normal
+            const scalar dn = d & nHat;
+            d = d - 2.0*dn*nHat;
+            d /= (mag(d) + VSMALL);
+            p0 = hitP + d*(0.51*ds); // nudge off the surface
+            Iray = Irefl;
+
+            if (iOwnHit)
+            {
+                ++nReflectLocal;
+            }
+        }
+    }
+
+    // Power density shape from physical cell power [W]
+    Qlaser_ = dimensionedScalar
+    (
+        "zero",
+        dimensionSet(1, -1, -3, 0, 0, 0, 0),
+        0
+    );
+    forAll(Qlaser_, celli)
+    {
+        if (powerCell[celli] > VSMALL)
+        {
+            Qlaser_[celli] = powerCell[celli]/mesh.V()[celli];
+        }
+    }
+
+    scalar absorbedLocal = 0.0;
+    forAll(powerCell, celli)
+    {
+        absorbedLocal += powerCell[celli];
+    }
+    reduce(absorbedLocal, sumOp<scalar>());
+
+    // Physics: absorbed ≤ incident (equality only if A=1 everywhere).
+    // Do NOT inflate to incidentPower — that would invent energy.
+    // Thermal limiter may only reduce further (numerical safety).
+    const scalar depositedBudget = max(absorbedLocal, 0.0);
+
+    label nLaserLimited = 0;
+    if (depositedBudget > SMALL)
+    {
+        redistributeLaserPower(CvEff, depositedBudget, dt, nLaserLimited);
+    }
+    else
+    {
+        Qlaser_ = dimensionedScalar
+        (
+            "zero",
+            dimensionSet(1, -1, -3, 0, 0, 0, 0),
+            0
+        );
+    }
+
+    reduce(nHitsLocal, sumOp<label>());
+    reduce(nReflectLocal, sumOp<label>());
+    reduce(nSegments, sumOp<label>());
+
+    if (debug || pimple.finalIter())
+    {
+        scalar appliedPower = 0.0;
+        forAll(Qlaser_, celli)
+        {
+            appliedPower += Qlaser_[celli]*mesh.V()[celli];
+        }
+        reduce(appliedPower, sumOp<scalar>());
+
+        Info<< "DED laser (rayTrace):"
+            << " powerFactor=" << powerFactor
+            << " incident=" << incidentPower
+            << " rayAbsorbed=" << absorbedLocal
+            << " applied=" << appliedPower
+            << " abs/inc="
+            << (incidentPower > SMALL ? absorbedLocal/incidentPower : 0)
+            << " nRays=" << nRays
+            << " nHits=" << nHitsLocal
+            << " nReflect=" << nReflectLocal
+            << " nLimited=" << nLaserLimited
+            << " xLaser=" << xLaser
+            << " z0=" << zOrigin
             << endl;
     }
 }
@@ -1028,6 +1550,308 @@ void Foam::solvers::compressibleVoF_DED::updateEvaporation
             << " limitedCells=" << limitedCells
             << " hotCells=" << nHotCells
             << " massTransfer=" << massConservingEvaporation_
+            << endl;
+    }
+}
+
+
+void Foam::solvers::compressibleVoF_DED::updatePowderSource
+(
+    const volScalarField& T
+)
+{
+    // Continuum DED powder feed:
+    //   ṁ_dep = η * powderFeedRate * ramp(t)
+    //   distributed with Gaussian under the laser on geometric free surface
+    //   that is hot/liquid enough to catch powder.
+    // Mass: S1 = +mDotPowder  (added metal)
+    // Energy: powderHeat ≈ mDot*[Cp*(Tp−T) − Lf_if_solid]
+
+    mDotPowder_ = dimensionedScalar
+    (
+        "zero",
+        dimensionSet(1, -3, -1, 0, 0, 0, 0),
+        0
+    );
+    powderHeat_ = dimensionedScalar
+    (
+        "zero",
+        dimensionSet(1, -1, -3, 0, 0, 0, 0),
+        0
+    );
+
+    if (!powderEnabled_ || powderFeedRate_ <= SMALL)
+    {
+        mDotPowder_.correctBoundaryConditions();
+        powderHeat_.correctBoundaryConditions();
+        return;
+    }
+
+    scalar powerFactor = 1.0;
+    if (laserRampTime_ > SMALL)
+    {
+        powerFactor = min(1.0, runTime.value()/laserRampTime_);
+    }
+
+    const scalar depositedMassRate =
+        powderCatchEfficiency_*powderFeedRate_*powerFactor;
+
+    if (depositedMassRate <= SMALL)
+    {
+        mDotPowder_.correctBoundaryConditions();
+        powderHeat_.correctBoundaryConditions();
+        return;
+    }
+
+    const scalar xLaser = xStart_ + laserSpeed_*runTime.value();
+    const scalar rP = max(powderRadius_, SMALL);
+    const scalar sigma = max(rP/3.0, SMALL);
+
+    const volVectorField gradAlpha(fvc::grad(alpha1));
+    const volScalarField magGradAlpha(mag(gradAlpha));
+
+    // Geometric free-surface cells under powder Gaussian
+    boolList isFreeSurface(mesh.nCells(), false);
+
+    forAll(alpha1, celli)
+    {
+        const scalar a = min(max(alpha1[celli], 0.0), 1.0);
+        const scalar magGa = magGradAlpha[celli];
+        const scalar cellLen = cbrt(mesh.V()[celli]);
+
+        if (a > 0.02 && a < 0.98 && magGa*cellLen > 1e-6)
+        {
+            isFreeSurface[celli] = true;
+        }
+    }
+
+    {
+        const labelUList& own = mesh.owner();
+        const labelUList& nei = mesh.neighbour();
+
+        forAll(own, facei)
+        {
+            const label c0 = own[facei];
+            const label c1 = nei[facei];
+            const scalar a0 = min(max(alpha1[c0], 0.0), 1.0);
+            const scalar a1 = min(max(alpha1[c1], 0.0), 1.0);
+
+            if ((a0 > 0.5 && a1 < 0.5) || (a1 > 0.5 && a0 < 0.5))
+            {
+                isFreeSurface[c0] = true;
+                isFreeSurface[c1] = true;
+            }
+        }
+
+        forAll(mesh.boundary(), patchi)
+        {
+            const fvPatch& patch = mesh.boundary()[patchi];
+            if (!patch.coupled())
+            {
+                continue;
+            }
+
+            const fvPatchScalarField& alphaPf =
+                alpha1.boundaryField()[patchi];
+            const labelUList& fc = patch.faceCells();
+
+            forAll(fc, facei)
+            {
+                const label c0 = fc[facei];
+                const scalar a0 = min(max(alpha1[c0], 0.0), 1.0);
+                const scalar aN = min(max(alphaPf[facei], 0.0), 1.0);
+
+                if ((a0 > 0.5 && aN < 0.5) || (a0 < 0.5 && aN > 0.5))
+                {
+                    isFreeSurface[c0] = true;
+                }
+            }
+        }
+    }
+
+    volScalarField weight
+    (
+        IOobject
+        (
+            "powderWeight",
+            runTime.name(),
+            mesh,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE
+        ),
+        mesh,
+        dimensionedScalar("zero", dimless/dimLength, 0)
+    );
+
+    label nCatchCells = 0;
+
+    forAll(weight, celli)
+    {
+        if (!isFreeSurface[celli])
+        {
+            continue;
+        }
+
+        const scalar a = min(max(alpha1[celli], 0.0), 1.0);
+        if (a < 0.05)
+        {
+            continue;
+        }
+
+        const point& C = mesh.C()[celli];
+        const scalar dx = C.x() - xLaser;
+        const scalar dy = C.y() - yStart_;
+        const scalar G = exp(-(dx*dx + dy*dy)/(2.0*sigma*sigma));
+
+        if (G < 1e-6)
+        {
+            continue;
+        }
+
+        // Catch only on liquid / mushy free surface under the beam
+        const scalar fL =
+            max(liquidFraction(T[celli]), fLiquid_[celli]);
+        if (fL < powderMinLiquidFraction_ && T[celli] < solidusTemperature_)
+        {
+            continue;
+        }
+
+        const scalar magGa = magGradAlpha[celli];
+        const scalar cellLen = cbrt(mesh.V()[celli]);
+
+        scalar delta = max(interfaceDelta_[celli], 2.0*a*(1.0 - a)*magGa);
+        if (a > 0.02 && a < 0.98)
+        {
+            delta = max(delta, magGa);
+        }
+        if (delta <= VSMALL || a >= 0.98)
+        {
+            delta = max(delta, 1.0/max(cellLen, SMALL));
+        }
+
+        // Prefer liquid fraction for catch distribution
+        const scalar catchF = max(fL, powderMinLiquidFraction_);
+        weight[celli] = G*delta*catchF;
+        ++nCatchCells;
+    }
+    reduce(nCatchCells, sumOp<label>());
+
+    scalar wIntegral = 0.0;
+    forAll(weight, celli)
+    {
+        wIntegral += weight[celli]*mesh.V()[celli];
+    }
+    reduce(wIntegral, sumOp<scalar>());
+
+    // Fallback: any metal free-surface under beam (ignore liquid gate)
+    if (wIntegral < SMALL)
+    {
+        weight = dimensionedScalar("zero", dimless/dimLength, 0);
+        nCatchCells = 0;
+
+        forAll(weight, celli)
+        {
+            if (!isFreeSurface[celli])
+            {
+                continue;
+            }
+
+            const scalar a = min(max(alpha1[celli], 0.0), 1.0);
+            if (a < 0.05)
+            {
+                continue;
+            }
+
+            const point& C = mesh.C()[celli];
+            const scalar dx = C.x() - xLaser;
+            const scalar dy = C.y() - yStart_;
+            const scalar G = exp(-(dx*dx + dy*dy)/(2.0*sigma*sigma));
+            if (G < 1e-6)
+            {
+                continue;
+            }
+
+            const scalar cellLen = cbrt(mesh.V()[celli]);
+            weight[celli] = G/max(cellLen, SMALL);
+            ++nCatchCells;
+        }
+        reduce(nCatchCells, sumOp<label>());
+
+        wIntegral = 0.0;
+        forAll(weight, celli)
+        {
+            wIntegral += weight[celli]*mesh.V()[celli];
+        }
+        reduce(wIntegral, sumOp<scalar>());
+    }
+
+    if (wIntegral <= SMALL)
+    {
+        mDotPowder_.correctBoundaryConditions();
+        powderHeat_.correctBoundaryConditions();
+
+        if (debug || pimple.finalIter())
+        {
+            Info<< "DED powder: depositedMassRate=" << depositedMassRate
+                << " applied=0 (no catch surface) nCatch=0"
+                << endl;
+        }
+        return;
+    }
+
+    const scalar scale = depositedMassRate/wIntegral;
+    const volScalarField& Cv1 = mixture.thermo1().Cv();
+
+    forAll(mDotPowder_, celli)
+    {
+        if (weight[celli] <= VSMALL)
+        {
+            continue;
+        }
+
+        const scalar md = scale*weight[celli]; // kg/m3/s
+        mDotPowder_[celli] = md;
+
+        // Enthalpy of added metal relative to local mixture temperature.
+        // q > 0 heats cell if Tp > T; cold powder cools (q < 0).
+        // Solid powder also requires melting energy Lf.
+        const scalar Tc = T[celli];
+        const scalar Cp = max(Cv1[celli], SMALL);
+        scalar q = md*Cp*(powderTemperature_ - Tc);
+
+        if (powderSolid_ && powderTemperature_ < solidusTemperature_)
+        {
+            // Cost to melt captured solid powder into the pool
+            q -= md*Lf_.value();
+        }
+
+        powderHeat_[celli] = q;
+    }
+
+    mDotPowder_.correctBoundaryConditions();
+    powderHeat_.correctBoundaryConditions();
+
+    if (debug || pimple.finalIter())
+    {
+        scalar massRate = 0.0;
+        scalar heatPower = 0.0;
+        forAll(mDotPowder_, celli)
+        {
+            massRate += mDotPowder_[celli]*mesh.V()[celli];
+            heatPower += powderHeat_[celli]*mesh.V()[celli];
+        }
+        reduce(massRate, sumOp<scalar>());
+        reduce(heatPower, sumOp<scalar>());
+
+        Info<< "DED powder:"
+            << " feed=" << powderFeedRate_
+            << " eta=" << powderCatchEfficiency_
+            << " deposited=" << depositedMassRate
+            << " applied=" << massRate
+            << " heatPower=" << heatPower
+            << " nCatch=" << nCatchCells
+            << " Tp=" << powderTemperature_
+            << " xLaser=" << xLaser
             << endl;
     }
 }

@@ -81,6 +81,28 @@ void Foam::solvers::compressibleVoF_DED::alphaSuSp
         }
     }
 
+    // Phase-D continuum powder: metal mass addition S1 = +mDotPowder, S2 = 0
+    //   Su += (α2/ρ1)*S1 = mDotPowder * α2/ρ1
+    if (powderEnabled_ && powderFeedRate_ > SMALL)
+    {
+        const volScalarField::Internal& rho1 = mixture.rho1()();
+
+        forAll(Su, celli)
+        {
+            const scalar md = mDotPowder_[celli];
+            if (md <= SMALL)
+            {
+                continue;
+            }
+
+            const scalar r1 = max(rho1[celli], SMALL);
+            const scalar a2 = min(max(alpha2[celli], 0.0), 1.0);
+
+            // Explicit α1 production (metal added into gas/interface cells)
+            Su[celli] += md*a2/r1;
+        }
+    }
+
     forAll(vDot, celli)
     {
         if (vDot[celli] > 0.0)

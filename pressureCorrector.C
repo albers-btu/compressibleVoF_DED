@@ -103,8 +103,9 @@ void Foam::solvers::compressibleVoF_DED::pressureCorrector()
           + fvModels().sourceProxy(alpha2, rho2, p_rgh)/rho2
         );
 
-        // Phase-C: metal→gas mass transfer volume source
-        // S1=-mDot, S2=+mDot → S1/ρ1 + S2/ρ2 = mDot (1/ρ2 − 1/ρ1)
+        // Phase change / mass sources → divergence:
+        //   evapor: S1=-mDotE, S2=+mDotE → mDotE (1/ρ2 − 1/ρ1)
+        //   powder: S1=+mDotP, S2=0      → mDotP / ρ1
         volScalarField::Internal phaseChangeDivU
         (
             volScalarField::Internal::New
@@ -117,11 +118,16 @@ void Foam::solvers::compressibleVoF_DED::pressureCorrector()
 
         if (massConservingEvaporation_)
         {
-            phaseChangeDivU =
+            phaseChangeDivU +=
                 (
                     mDotEvap_
                    *(scalar(1)/rho2 - scalar(1)/rho1)
                 )();
+        }
+
+        if (powderEnabled_ && powderFeedRate_ > SMALL)
+        {
+            phaseChangeDivU += (mDotPowder_/rho1)();
         }
 
         // Make the fluxes relative to the mesh motion

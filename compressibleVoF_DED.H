@@ -26,6 +26,9 @@ Description
     Phase C: Picard latent-heat treatment, mass-conserving evaporation
              (α + continuity), Beer–Lambert bulk laser absorption option.
 
+    Phase D: continuum powder / material addition on free surface under the
+             laser (mass + energy + α / continuity / pressure coupling).
+
 SourceFiles
     compressibleVoF_DED.C
     DEDPhysics.C
@@ -95,6 +98,10 @@ protected:
         volScalarField evaporationSink_;
         //- Volumetric mass evaporation rate metal→gas [kg/m3/s]
         volScalarField mDotEvap_;
+        //- Volumetric powder mass addition rate (gas/metal → metal) [kg/m3/s]
+        volScalarField mDotPowder_;
+        //- Thermal power density from powder enthalpy [W/m3] (can be negative)
+        volScalarField powderHeat_;
         volScalarField interfaceDelta_;
         //- Laser volumetric power [W/m3] (diagnostic)
         volScalarField Qlaser_;
@@ -126,6 +133,34 @@ protected:
         scalar laserAbsorptionLength_;
         //- Fraction of deposited power routed to bulk (rest surface); [0,1]
         scalar laserBulkFraction_;
+
+        //- Laser deposition model: "geometric" | "rayTrace"
+        word laserModel_;
+        //- Rays per side for rayTrace (total rays ≈ nRaySide^2)
+        label nRaySide_;
+        //- Max surface reflections after first hit (0 = single hit only)
+        label maxLaserReflections_;
+        //- Ray march step as fraction of typical cell length
+        scalar laserRayStepFraction_;
+        //- Aperture / start plane z (absolute); < -GREAT/2 → domain max z
+        scalar laserRayOriginZ_;
+        //- Minimum |μ|=|d·n| for absorption (grazing cutoff)
+        scalar laserMinCosIncidence_;
+
+        //- Continuum powder feed (material addition)
+        Switch powderEnabled_;
+        //- Nominal powder mass feed rate [kg/s]
+        scalar powderFeedRate_;
+        //- Catch efficiency η ∈ [0,1] → deposited ṁ = η * feedRate
+        scalar powderCatchEfficiency_;
+        //- Enthalpy temperature of added metal [K]
+        scalar powderTemperature_;
+        //- Gaussian radius for powder distribution [m] (default: laserRadius)
+        scalar powderRadius_;
+        //- Minimum liquid fraction on free surface to catch powder
+        scalar powderMinLiquidFraction_;
+        //- If true, solid powder pays latent heat Lf on capture
+        Switch powderSolid_;
 
         scalar solidusTemperature_;
         scalar liquidusTemperature_;
@@ -175,8 +210,23 @@ protected:
         //- Update fLiquid_ from T with under-relaxation
         void updateLiquidFraction(const volScalarField& T);
 
-        //- Build laser power density into Qlaser_
+        //- Build laser power density into Qlaser_ (dispatches model)
         void updateLaserSource(const volScalarField& CvEff);
+
+        //- Geometric free-surface + projected-area laser (legacy / fallback)
+        void updateLaserSourceGeometric(const volScalarField& CvEff);
+
+        //- Ray-traced laser with optional multi-reflection (CPU + OpenMP)
+        void updateLaserSourceRayTrace(const volScalarField& CvEff);
+
+        //- Cap Qlaser_ by thermal headroom and redistribute leftover power
+        void redistributeLaserPower
+        (
+            const volScalarField& CvEff,
+            const scalar depositedPower,
+            const scalar dt,
+            label& nLaserLimited
+        );
 
         //- Evaporation energy sink + optional mass transfer rate
         void updateEvaporation
@@ -185,6 +235,9 @@ protected:
             const volScalarField& CvEff,
             const volScalarField& rho1
         );
+
+        //- Continuum powder mass + enthalpy source on free surface under laser
+        void updatePowderSource(const volScalarField& T);
 
         //- Marangoni volumetric + CSF face force; recoil pressure
         void updateSurfaceForces(const volScalarField& T);
@@ -205,7 +258,8 @@ protected:
                !incompressible()
              || fvModels().addsSupToField(mixture_.rho1().name())
              || fvModels().addsSupToField(mixture_.rho2().name())
-             || massConservingEvaporation_;
+             || massConservingEvaporation_
+             || (powderEnabled_ && powderFeedRate_ > SMALL);
         }
 
         virtual tmp<volScalarField> psiByRho() const

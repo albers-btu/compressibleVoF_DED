@@ -252,6 +252,44 @@ Foam::solvers::compressibleVoF_DED::compressibleVoF_DED(fvMesh& mesh)
         )
     ),
 
+    mDotPowder_
+    (
+        IOobject
+        (
+            "mDotPowder",
+            runTime.name(),
+            mesh,
+            IOobject::READ_IF_PRESENT,
+            IOobject::AUTO_WRITE
+        ),
+        mesh,
+        dimensionedScalar
+        (
+            "zero",
+            dimensionSet(1, -3, -1, 0, 0, 0, 0),
+            0.0
+        )
+    ),
+
+    powderHeat_
+    (
+        IOobject
+        (
+            "powderHeat",
+            runTime.name(),
+            mesh,
+            IOobject::READ_IF_PRESENT,
+            IOobject::AUTO_WRITE
+        ),
+        mesh,
+        dimensionedScalar
+        (
+            "zero",
+            dimensionSet(1, -1, -3, 0, 0, 0, 0),
+            0.0
+        )
+    ),
+
     interfaceDelta_
     (
         IOobject
@@ -307,6 +345,19 @@ Foam::solvers::compressibleVoF_DED::compressibleVoF_DED(fvMesh& mesh)
     liquidFractionRelaxation_(0.7),
     laserAbsorptionLength_(0),
     laserBulkFraction_(0.25),
+    laserModel_("rayTrace"),
+    nRaySide_(32),
+    maxLaserReflections_(3),
+    laserRayStepFraction_(0.35),
+    laserRayOriginZ_(-GREAT),
+    laserMinCosIncidence_(0.05),
+    powderEnabled_(false),
+    powderFeedRate_(0),
+    powderCatchEfficiency_(0.7),
+    powderTemperature_(300),
+    powderRadius_(0),
+    powderMinLiquidFraction_(0.1),
+    powderSolid_(true),
     solidusTemperature_(1700),
     liquidusTemperature_(1800),
     Tboil_(3000),
@@ -395,15 +446,16 @@ void Foam::solvers::compressibleVoF_DED::prePredictor()
 
     rhoPhi = alphaRhoPhi1 + alphaRhoPhi2;
 
-    // Continuity residuals include Phase-C mass transfer metal→gas:
-    //   metal: S1 = -mDotEvap
-    //   gas:   S2 = +mDotEvap
+    // Continuity residuals:
+    //   evaporation: metal S1=-mDotEvap, gas S2=+mDotEvap
+    //   powder:      metal S1=+mDotPowder (added metal), gas S2=0
     // contErr = ddt + div - S
     contErr1 =
     (
         fvc::ddt(alpha1, rho1)()() + fvc::div(alphaRhoPhi1)()()
       - (fvModels().source(alpha1, rho1)&rho1)()
       + mDotEvap_()
+      - mDotPowder_()
     );
 
     contErr2 =
